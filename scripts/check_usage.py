@@ -6,9 +6,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import selectors
+import queue
 import shutil
 import subprocess
+import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -29,10 +31,14 @@ def find_codex() -> str:
     discovered = shutil.which("codex")
     if discovered:
         return discovered
-    mac_app_binary = "/Applications/Codex.app/Contents/Resources/codex"
-    if os.path.isfile(mac_app_binary):
-        return mac_app_binary
-    raise RuntimeError("Codex CLI executable not found")
+    if sys.platform == "darwin":
+        mac_app_binary = "/Applications/Codex.app/Contents/Resources/codex"
+        if os.path.isfile(mac_app_binary):
+            return mac_app_binary
+    raise RuntimeError(
+        "Codex CLI executable not found on PATH; set CHECKPOINT_WORK_CODEX_BIN "
+        "to its full path"
+    )
 
 
 def send_message(process: subprocess.Popen[str], message: dict[str, Any]) -> None:
@@ -42,36 +48,49 @@ def send_message(process: subprocess.Popen[str], message: dict[str, Any]) -> Non
     process.stdin.flush()
 
 
-def wait_for_response(
-    process: subprocess.Popen[str], request_id: int, timeout_seconds: float
-) -> dict[str, Any]:
-    if process.stdout is None:
-        raise RuntimeError("Codex app-server stdout is unavailable")
-    selector = selectors.DefaultSelector()
-    selector.register(process.stdout, selectors.EVENT_READ)
-    deadline = time.monotonic() + timeout_seconds
-    try:
-        while time.monotonic() < deadline:
-            remaining = max(0.0, deadline - time.monotonic())
-            if not selector.select(remaining):
-                break
-            line = process.stdout.readline()
-            if not line:
+class JsonLineReader:
+    """Read app-server messages without relying on platform-specific pipe selectors."""
+
+    def __init__(self, stream: Any) -> None:
+        self.messages: queue.Queue[dict[str, Any] | None] = queue.Queue()
+        self.thread = threading.Thread(target=self._read, args=(stream,), daemon=True)
+        self.thread.start()
+
+    def _read(self, stream: Any) -> None:
+        try:
+            for line in stream:
+                try:
+                    message = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(message, dict):
+                    self.messages.put(message)
+        finally:
+            self.messages.put(None)
+
+    def wait_for_response(
+        self, request_id: int, timeout_seconds: float
+    ) -> dict[str, Any]:
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
                 break
             try:
-                message = json.loads(line)
-            except json.JSONDecodeError:
+                message = self.messages.get(timeout=remaining)
+            except queue.Empty:
+                break
+            if message is None:
+                break
+            if message.get("id") != request_id:
                 continue
-            if message.get("id") == request_id:
-                if "error" in message:
-                    raise RuntimeError(f"app-server error: {message['error']}")
-                result = message.get("result")
-                if not isinstance(result, dict):
-                    raise RuntimeError("app-server returned no result object")
-                return result
-    finally:
-        selector.close()
-    raise RuntimeError(f"timed out waiting for app-server response {request_id}")
+            if "error" in message:
+                raise RuntimeError(f"app-server error: {message['error']}")
+            result = message.get("result")
+            if not isinstance(result, dict):
+                raise RuntimeError("app-server returned no result object")
+            return result
+        raise RuntimeError(f"timed out waiting for app-server response {request_id}")
 
 
 def read_codex_rate_limits(timeout_seconds: float) -> dict[str, Any]:
@@ -84,6 +103,9 @@ def read_codex_rate_limits(timeout_seconds: float) -> dict[str, Any]:
         bufsize=1,
     )
     try:
+        if process.stdout is None:
+            raise RuntimeError("Codex app-server stdout is unavailable")
+        reader = JsonLineReader(process.stdout)
         send_message(
             process,
             {
@@ -95,10 +117,10 @@ def read_codex_rate_limits(timeout_seconds: float) -> dict[str, Any]:
                 },
             },
         )
-        wait_for_response(process, 1, timeout_seconds)
+        reader.wait_for_response(1, timeout_seconds)
         send_message(process, {"method": "initialized"})
         send_message(process, {"id": 2, "method": "account/rateLimits/read"})
-        return wait_for_response(process, 2, timeout_seconds)
+        return reader.wait_for_response(2, timeout_seconds)
     finally:
         if process.stdin is not None:
             process.stdin.close()
@@ -129,6 +151,13 @@ def add_reserve_decision(
         result["reserve_percent"] = reserve
         result["may_start_next_checkpoint"] = result["remaining_percent"] > reserve
     return result
+
+
+def window_identity(provider: str, name: str, resets_at: Any) -> str | None:
+    """Identify a concrete rate-limit window without guessing when it resets."""
+    if resets_at is None:
+        return None
+    return f"{provider}:{name}:{resets_at}"
 
 
 def summarize_codex(snapshot: dict[str, Any], reserve: float | None) -> dict[str, Any]:
@@ -168,18 +197,26 @@ def summarize_codex(snapshot: dict[str, Any], reserve: float | None) -> dict[str
         else:
             raise RuntimeError("rate-limit snapshot contains no measurable window")
 
-    return add_reserve_decision(
-        {
-            "ok": True,
-            "provider": "codex",
-            "limit_id": snapshot.get("limitId", "codex"),
-            "plan_type": snapshot.get("planType"),
-            "remaining_percent": remaining,
-            "limiting_window": limiting_window,
-            "windows": windows,
-        },
-        reserve,
+    limiting_details = next(
+        (window for window in windows if window["name"] == limiting_window), None
     )
+    limiting_resets_at = (
+        limiting_details.get("resets_at") if limiting_details is not None else None
+    )
+    result = {
+        "ok": True,
+        "provider": "codex",
+        "limit_id": snapshot.get("limitId", "codex"),
+        "plan_type": snapshot.get("planType"),
+        "remaining_percent": remaining,
+        "limiting_window": limiting_window,
+        "limiting_resets_at": limiting_resets_at,
+        "limiting_window_id": window_identity(
+            "codex", limiting_window, limiting_resets_at
+        ),
+        "windows": windows,
+    }
+    return add_reserve_decision(result, reserve)
 
 
 def claude_cache_path(configured: str | None = None) -> Path:
@@ -232,12 +269,17 @@ def summarize_claude(snapshot: dict[str, Any], reserve: float | None) -> dict[st
     if not windows:
         raise RuntimeError("Claude usage cache contains no measurable rate-limit window")
     limiting = min(windows, key=lambda item: item["remaining_percent"])
+    limiting_resets_at = limiting.get("resets_at")
     return add_reserve_decision(
         {
             "ok": True,
             "provider": "claude",
             "remaining_percent": limiting["remaining_percent"],
             "limiting_window": limiting["name"],
+            "limiting_resets_at": limiting_resets_at,
+            "limiting_window_id": window_identity(
+                "claude", str(limiting["name"]), limiting_resets_at
+            ),
             "captured_at": snapshot.get("captured_at"),
             "cache_age_seconds": round(float(snapshot.get("cache_age_seconds", 0)), 1),
             "windows": windows,
