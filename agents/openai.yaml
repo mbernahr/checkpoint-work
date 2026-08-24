@@ -1,7 +1,7 @@
 interface:
   display_name: "Checkpoint Work"
-  short_description: "Checkpoint work with a usage reserve"
-  default_prompt: "Use $checkpoint-work 10 to complete this task in verified checkpoints while preserving 10% of remaining usage."
+  short_description: "Plan-aware work with usage and cost guards"
+  default_prompt: "Use $checkpoint-work 10 to complete this task in verified checkpoints while preserving 10% of remaining usage; add --max-cost-usd only when a run-cost limit is needed."
 
 policy:
   allow_implicit_invocation: false

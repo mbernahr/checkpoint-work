@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Capture Claude Code status-line rate limits for checkpoint-work."""
+"""Capture Claude Code status-line rate limits and session cost."""
 
 from __future__ import annotations
 
@@ -22,10 +22,22 @@ def cache_path() -> Path:
 
 def write_snapshot(data: dict[str, Any], destination: Path) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
+    cost = data.get("cost")
+    total_cost_usd = cost.get("total_cost_usd") if isinstance(cost, dict) else None
+    cost_snapshot = None
+    if isinstance(total_cost_usd, (int, float)) and total_cost_usd >= 0:
+        cost_snapshot = {
+            "total_cost_usd": total_cost_usd,
+            "quality": "estimated",
+            "source": "claude_statusline",
+            "scope": "session",
+            "source_id": data.get("session_id"),
+        }
     payload = {
-        "schema_version": 1,
+        "schema_version": 2,
         "captured_at": time.time(),
         "rate_limits": data.get("rate_limits"),
+        "cost": cost_snapshot,
     }
     handle, temporary_name = tempfile.mkstemp(
         prefix=destination.name + ".", dir=destination.parent
@@ -52,6 +64,10 @@ def status_text(data: dict[str, Any]) -> str:
             used = window.get("used_percentage") if isinstance(window, dict) else None
             if isinstance(used, (int, float)):
                 parts.append(f"{label} {max(0, 100 - used):g}% left")
+    cost = data.get("cost")
+    total_cost_usd = cost.get("total_cost_usd") if isinstance(cost, dict) else None
+    if isinstance(total_cost_usd, (int, float)) and total_cost_usd >= 0:
+        parts.append(f"~${total_cost_usd:.2f} session")
     if len(parts) == 1:
         parts.append("usage unavailable")
     return " · ".join(parts)

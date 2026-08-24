@@ -7,16 +7,22 @@ import argparse
 import json
 import os
 import queue
+import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
 
 DEFAULT_CLAUDE_CACHE = Path.home() / ".claude" / "checkpoint-work-usage.json"
+DEFAULT_COST_STATE_DIR = Path.home() / ".checkpoint-work" / "cost-runs"
+COST_QUALITIES = ("reported", "calculated", "estimated")
+COST_RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 
 def emit(payload: dict[str, Any], exit_code: int = 0) -> None:
@@ -93,7 +99,9 @@ class JsonLineReader:
         raise RuntimeError(f"timed out waiting for app-server response {request_id}")
 
 
-def read_codex_rate_limits(timeout_seconds: float) -> dict[str, Any]:
+def read_codex_data(
+    timeout_seconds: float, thread_id: str | None = None
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
     process = subprocess.Popen(
         [find_codex(), "app-server", "--listen", "stdio://"],
         stdin=subprocess.PIPE,
@@ -112,7 +120,7 @@ def read_codex_rate_limits(timeout_seconds: float) -> dict[str, Any]:
                 "id": 1,
                 "method": "initialize",
                 "params": {
-                    "clientInfo": {"name": "checkpoint-work", "version": "2.0.0"},
+                    "clientInfo": {"name": "checkpoint-work", "version": "2.1.0"},
                     "capabilities": {"experimentalApi": True},
                 },
             },
@@ -120,7 +128,18 @@ def read_codex_rate_limits(timeout_seconds: float) -> dict[str, Any]:
         reader.wait_for_response(1, timeout_seconds)
         send_message(process, {"method": "initialized"})
         send_message(process, {"id": 2, "method": "account/rateLimits/read"})
-        return reader.wait_for_response(2, timeout_seconds)
+        rate_limits = reader.wait_for_response(2, timeout_seconds)
+        if not thread_id:
+            return rate_limits, None
+        send_message(
+            process,
+            {
+                "id": 3,
+                "method": "account/usage/read",
+                "params": {"threadId": thread_id},
+            },
+        )
+        return rate_limits, reader.wait_for_response(3, timeout_seconds)
     finally:
         if process.stdin is not None:
             process.stdin.close()
@@ -130,6 +149,11 @@ def read_codex_rate_limits(timeout_seconds: float) -> dict[str, Any]:
         except subprocess.TimeoutExpired:
             process.kill()
             process.wait(timeout=2)
+
+
+def read_codex_rate_limits(timeout_seconds: float) -> dict[str, Any]:
+    rate_limits, _ = read_codex_data(timeout_seconds)
+    return rate_limits
 
 
 def select_codex_snapshot(response: dict[str, Any]) -> dict[str, Any]:
@@ -158,6 +182,180 @@ def window_identity(provider: str, name: str, resets_at: Any) -> str | None:
     if resets_at is None:
         return None
     return f"{provider}:{name}:{resets_at}"
+
+
+def codex_cost_snapshot(response: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(response, dict):
+        return None
+    thread_usage = response.get("threadUsage")
+    if not isinstance(thread_usage, dict):
+        return None
+    usd_micros = thread_usage.get("estimatedUsageUsdMicros")
+    thread_id = thread_usage.get("threadId")
+    if not isinstance(usd_micros, int) or usd_micros < 0:
+        return None
+    return {
+        "total_cost_usd": float(Decimal(usd_micros) / Decimal(1_000_000)),
+        "quality": "estimated",
+        "source": "codex_app_server",
+        "scope": "thread",
+        "source_id": thread_id,
+    }
+
+
+def decimal_usd(value: Any, field: str) -> Decimal:
+    try:
+        parsed = Decimal(str(value))
+    except (InvalidOperation, ValueError) as exc:
+        raise RuntimeError(f"{field} is not a valid USD amount") from exc
+    if not parsed.is_finite() or parsed < 0:
+        raise RuntimeError(f"{field} must be a finite non-negative USD amount")
+    return parsed
+
+
+def cost_state_path(directory: Path, run_id: str) -> Path:
+    if not COST_RUN_ID_PATTERN.fullmatch(run_id):
+        raise RuntimeError(
+            "cost run id must contain only letters, digits, dots, underscores, or hyphens"
+        )
+    return directory / f"{run_id}.json"
+
+
+def write_json_atomic(destination: Path, payload: dict[str, Any]) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    handle, temporary_name = tempfile.mkstemp(
+        prefix=destination.name + ".", dir=destination.parent
+    )
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8") as temporary:
+            json.dump(payload, temporary, ensure_ascii=False, separators=(",", ":"))
+            temporary.write("\n")
+        os.replace(temporary_name, destination)
+    except Exception:
+        try:
+            os.unlink(temporary_name)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def read_cost_state(path: Path) -> dict[str, Any] | None:
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"cannot read cost run state: {exc}") from exc
+    if not isinstance(payload, dict) or payload.get("schema_version") != 1:
+        raise RuntimeError("cost run state has an unsupported schema")
+    return payload
+
+
+def unavailable_cost_result(
+    result: dict[str, Any], maximum: Decimal, reason: str, run_id: str
+) -> dict[str, Any]:
+    result.update(
+        {
+            "max_cost_usd": float(maximum),
+            "run_cost_usd": None,
+            "cost_quality": "unavailable",
+            "cost_source": None,
+            "cost_scope": None,
+            "cost_run_id": run_id,
+            "cost_limit_allows_start": False,
+            "cost_error": reason,
+            "may_start_next_checkpoint": False,
+        }
+    )
+    return result
+
+
+def apply_cost_guard(
+    result: dict[str, Any],
+    maximum: float | None,
+    run_id: str | None,
+    cost_snapshot: dict[str, Any] | None,
+    state_directory: Path,
+) -> dict[str, Any]:
+    if maximum is None:
+        return result
+    max_cost = decimal_usd(maximum, "maximum cost")
+    if not run_id:
+        raise RuntimeError("--cost-run-id is required with --max-cost-usd")
+    state_path = cost_state_path(state_directory, run_id)
+    if not isinstance(cost_snapshot, dict):
+        return unavailable_cost_result(
+            result, max_cost, "provider supplied no measurable cost", run_id
+        )
+
+    quality = cost_snapshot.get("quality")
+    if quality not in COST_QUALITIES:
+        return unavailable_cost_result(
+            result, max_cost, "cost quality is missing or unsupported", run_id
+        )
+    source = cost_snapshot.get("source")
+    scope = cost_snapshot.get("scope")
+    source_id = cost_snapshot.get("source_id")
+    if not isinstance(source, str) or not source:
+        return unavailable_cost_result(
+            result, max_cost, "cost source is missing", run_id
+        )
+    current_total = decimal_usd(cost_snapshot.get("total_cost_usd"), "current cost")
+    state = read_cost_state(state_path)
+    if state is None:
+        baseline = current_total
+        state = {
+            "schema_version": 1,
+            "run_id": run_id,
+            "baseline_total_usd": str(baseline),
+            "quality": quality,
+            "source": source,
+            "scope": scope,
+            "source_id": source_id,
+            "started_at": time.time(),
+        }
+        write_json_atomic(state_path, state)
+    else:
+        for field, current in (
+            ("quality", quality),
+            ("source", source),
+            ("scope", scope),
+            ("source_id", source_id),
+        ):
+            if state.get(field) != current:
+                return unavailable_cost_result(
+                    result,
+                    max_cost,
+                    f"cost {field} changed during the run",
+                    run_id,
+                )
+        baseline = decimal_usd(state.get("baseline_total_usd"), "cost baseline")
+
+    if current_total < baseline:
+        return unavailable_cost_result(
+            result,
+            max_cost,
+            "current cost is below the saved baseline; the provider session may have reset",
+            run_id,
+        )
+    run_cost = current_total - baseline
+    cost_allows_start = run_cost < max_cost
+    usage_allows_start = result.get("may_start_next_checkpoint") is not False
+    result.update(
+        {
+            "max_cost_usd": float(max_cost),
+            "run_cost_usd": float(run_cost),
+            "cost_quality": quality,
+            "cost_source": source,
+            "cost_scope": scope,
+            "cost_run_id": run_id,
+            "cost_baseline_usd": float(baseline),
+            "current_cost_total_usd": float(current_total),
+            "cost_limit_allows_start": cost_allows_start,
+            "may_start_next_checkpoint": usage_allows_start and cost_allows_start,
+        }
+    )
+    return result
 
 
 def summarize_codex(snapshot: dict[str, Any], reserve: float | None) -> dict[str, Any]:
@@ -246,7 +444,12 @@ def read_claude_snapshot(cache: Path, max_age_seconds: float) -> dict[str, Any]:
     rate_limits = payload.get("rate_limits")
     if not isinstance(rate_limits, dict):
         raise RuntimeError("Claude rate-limit data is unavailable for this session or plan")
-    return {"captured_at": captured_at, "cache_age_seconds": age, **rate_limits}
+    return {
+        "captured_at": captured_at,
+        "cache_age_seconds": age,
+        "cost_snapshot": payload.get("cost"),
+        **rate_limits,
+    }
 
 
 def summarize_claude(snapshot: dict[str, Any], reserve: float | None) -> dict[str, Any]:
@@ -288,6 +491,20 @@ def summarize_claude(snapshot: dict[str, Any], reserve: float | None) -> dict[st
     )
 
 
+def external_cost_snapshot(args: argparse.Namespace) -> dict[str, Any] | None:
+    if args.current_cost_usd is None:
+        return None
+    if args.cost_quality is None:
+        raise RuntimeError("--cost-quality is required with --current-cost-usd")
+    return {
+        "total_cost_usd": args.current_cost_usd,
+        "quality": args.cost_quality,
+        "source": args.cost_source or "external",
+        "scope": args.cost_scope or "run",
+        "source_id": args.cost_source_id,
+    }
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Check whether another checkpoint may start without crossing a usage reserve."
@@ -304,6 +521,32 @@ def parse_args() -> argparse.Namespace:
         default=900.0,
         help="Maximum acceptable Claude cache age in seconds (default: 900).",
     )
+    parser.add_argument(
+        "--max-cost-usd",
+        type=float,
+        help="Do not start another checkpoint once this run has reached this USD cost.",
+    )
+    parser.add_argument(
+        "--cost-run-id",
+        help="Stable identifier used to preserve the cost baseline across checks.",
+    )
+    parser.add_argument(
+        "--cost-state-dir",
+        help="Override the directory for cost baseline state.",
+    )
+    parser.add_argument(
+        "--current-cost-usd",
+        type=float,
+        help="Provider-reported cumulative cost for hosts without a built-in adapter.",
+    )
+    parser.add_argument("--cost-quality", choices=COST_QUALITIES)
+    parser.add_argument("--cost-source")
+    parser.add_argument("--cost-scope", choices=("session", "thread", "run", "account"))
+    parser.add_argument("--cost-source-id")
+    parser.add_argument(
+        "--codex-thread-id",
+        help="Override the current Codex thread used for estimated cost lookup.",
+    )
     args = parser.parse_args()
     if args.reserve is not None and not 0 <= args.reserve <= 100:
         parser.error("--reserve must be between 0 and 100")
@@ -311,19 +554,62 @@ def parse_args() -> argparse.Namespace:
         parser.error("--timeout must be greater than zero")
     if args.max_cache_age <= 0:
         parser.error("--max-cache-age must be greater than zero")
+    if args.max_cost_usd is not None and args.max_cost_usd < 0:
+        parser.error("--max-cost-usd must be zero or greater")
+    if args.current_cost_usd is not None and args.current_cost_usd < 0:
+        parser.error("--current-cost-usd must be zero or greater")
+    if args.current_cost_usd is None and any(
+        value is not None
+        for value in (
+            args.cost_quality,
+            args.cost_source,
+            args.cost_scope,
+            args.cost_source_id,
+        )
+    ):
+        parser.error("cost source options require --current-cost-usd")
     return args
 
 
 def main() -> None:
     args = parse_args()
     try:
+        state_directory = (
+            Path(args.cost_state_dir).expanduser()
+            if args.cost_state_dir
+            else DEFAULT_COST_STATE_DIR
+        )
+        supplied_cost = external_cost_snapshot(args)
         if args.provider == "claude":
             snapshot = read_claude_snapshot(
                 claude_cache_path(args.claude_cache), args.max_cache_age
             )
-            emit(summarize_claude(snapshot, args.reserve))
-        response = read_codex_rate_limits(args.timeout)
-        emit(summarize_codex(select_codex_snapshot(response), args.reserve))
+            result = summarize_claude(snapshot, args.reserve)
+            emit(
+                apply_cost_guard(
+                    result,
+                    args.max_cost_usd,
+                    args.cost_run_id,
+                    supplied_cost or snapshot.get("cost_snapshot"),
+                    state_directory,
+                )
+            )
+        thread_id = (
+            args.codex_thread_id
+            or os.environ.get("CHECKPOINT_WORK_CODEX_THREAD_ID")
+            or os.environ.get("CODEX_THREAD_ID")
+        )
+        response, usage_response = read_codex_data(args.timeout, thread_id)
+        result = summarize_codex(select_codex_snapshot(response), args.reserve)
+        emit(
+            apply_cost_guard(
+                result,
+                args.max_cost_usd,
+                args.cost_run_id,
+                supplied_cost or codex_cost_snapshot(usage_response),
+                state_directory,
+            )
+        )
     except Exception as exc:
         emit({"ok": False, "provider": args.provider, "error": str(exc)}, exit_code=2)
 

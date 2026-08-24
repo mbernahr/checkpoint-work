@@ -34,6 +34,23 @@ class CaptureTests(unittest.TestCase):
                 payload["rate_limits"]["five_hour"]["used_percentage"], 25
             )
 
+    def test_writes_estimated_session_cost(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            destination = pathlib.Path(directory) / "usage.json"
+            CAPTURE.write_snapshot(
+                {
+                    "session_id": "session-1",
+                    "cost": {"total_cost_usd": 1.25},
+                    "rate_limits": {},
+                },
+                destination,
+            )
+            payload = json.loads(destination.read_text(encoding="utf-8"))
+            self.assertEqual(payload["schema_version"], 2)
+            self.assertEqual(payload["cost"]["total_cost_usd"], 1.25)
+            self.assertEqual(payload["cost"]["quality"], "estimated")
+            self.assertEqual(payload["cost"]["source_id"], "session-1")
+
     def test_status_text_shows_remaining(self) -> None:
         data = {
             "rate_limits": {
@@ -43,6 +60,16 @@ class CaptureTests(unittest.TestCase):
         }
         self.assertEqual(
             CAPTURE.status_text(data), "Checkpoint Work · 5h 75% left · 7d 40% left"
+        )
+
+    def test_status_text_shows_estimated_session_cost(self) -> None:
+        data = {
+            "rate_limits": {"five_hour": {"used_percentage": 25}},
+            "cost": {"total_cost_usd": 1.234},
+        }
+        self.assertEqual(
+            CAPTURE.status_text(data),
+            "Checkpoint Work · 5h 75% left · ~$1.23 session",
         )
 
 
